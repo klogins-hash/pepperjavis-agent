@@ -1,0 +1,30 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    database: pepperjavis
+    user: pepperjavis
+    jsonData:
+      sslmode: 'disable'
+      postgresVersion: 1600
+    secureJsonData:
+      password: 'pepperjavis_secure_pass'
+
+  - name: Redis
+    type: redis-datasource
+    access: proxy
+    jsonData:
+      client: standalone
+      mode: standalone
+    secureJsonData:
+      password: 'redis_secure_pass'

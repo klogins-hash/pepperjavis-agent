@@ -1,0 +1,174 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pepperjavis-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pepperjavis}
+      POSTGRES_USER: ${POSTGRES_USER:-pepperjavis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pepperjavis_secure_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pepperjavis}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pepperjavis-network
+
+  # Redis for caching and sessions
+  redis:
+    image: redis:7-alpine
+    container_name: pepperjavis-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secure_pass}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pepperjavis-network
+
+  # MinIO for object storage
+  minio:
+    image: minio/minio:latest
+    container_name: pepperjavis-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_secure_pass}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - pepperjavis-network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: pepperjavis-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - pepperjavis-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pepperjavis-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: redis-datasource,postgres
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - pepperjavis-network
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: pepperjavis-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Direct HTTP receiver
+      - "6831:6831/udp"  # Thrift UDP receiver
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
+    networks:
+      - pepperjavis-network
+
+  # PepperJarvis Agent Application
+  pepperjavis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pepperjavis-agent
+    environment:
+      # LLM Configuration
+      STRANDS_MODEL_PROVIDER: ${STRANDS_MODEL_PROVIDER:-bedrock}
+      STRANDS_MODEL_ID: ${STRANDS_MODEL_ID:-us.amazon.nova-pro-v1:0}
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+
+      # Database Configuration
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pepperjavis}:${POSTGRES_PASSWORD:-pepperjavis_secure_pass}@postgres:5432/${POSTGRES_DB:-pepperjavis}
+
+      # Redis Configuration
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_pass}@redis:6379/0
+
+      # MinIO Configuration
+      MINIO_URL: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_secure_pass}
+      MINIO_BUCKET: ${MINIO_BUCKET:-pepperjavis}
+
+      # Observability
+      JAEGER_AGENT_HOST: jaeger
+      JAEGER_AGENT_PORT: 6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:14268/api/traces
+
+      # Application Configuration
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./pepperjavis:/app/pepperjavis
+    networks:
+      - pepperjavis-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  pepperjavis-network:
+    driver: bridge
