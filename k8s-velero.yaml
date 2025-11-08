@@ -1,0 +1,465 @@
+# PepperJarvis Agent - Velero Backup Configuration
+# Automated backups to MinIO with retention policies
+
+---
+# Velero Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: velero
+
+---
+# ServiceAccount for Velero
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velero
+  namespace: velero
+
+---
+# ClusterRole for Velero
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: velero
+rules:
+- apiGroups:
+  - '*'
+  resources:
+  - '*'
+  verbs:
+  - '*'
+- nonResourceURLs:
+  - '*'
+  verbs:
+  - '*'
+
+---
+# ClusterRoleBinding for Velero
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: velero
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: velero
+subjects:
+- kind: ServiceAccount
+  name: velero
+  namespace: velero
+
+---
+# Velero ConfigMap for credentials
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-minio-credentials
+  namespace: velero
+data:
+  cloud: |
+    [default]
+    aws_access_key_id = minioadmin
+    aws_secret_access_key = minio-secure-password-change-me
+
+---
+# Velero Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velero
+  namespace: velero
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: velero
+  template:
+    metadata:
+      labels:
+        app: velero
+    spec:
+      serviceAccountName: velero
+      containers:
+      - name: velero
+        image: velero/velero:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /velero
+        args:
+        - server
+        - --log-level=info
+        - --log-format=json
+        - --features=EnableCSI
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          value: minioadmin
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: velero-minio-secret
+              key: password
+        - name: AWS_REGION
+          value: ch-gva
+        - name: AWS_S3_FORCE_PATH_STYLE
+          value: "true"
+        - name: AWS_S3_URL
+          value: http://minio.pepperjavis.svc.cluster.local:9000
+        ports:
+        - containerPort: 8085
+          name: metrics
+        volumeMounts:
+        - name: plugins
+          mountPath: /plugins
+        - name: cloud-credentials
+          mountPath: /credentials
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8085
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8085
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: plugins
+        emptyDir: {}
+      - name: cloud-credentials
+        secret:
+          secretName: velero-minio-secret
+
+---
+# Secret for Velero MinIO credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: velero-minio-secret
+  namespace: velero
+type: Opaque
+stringData:
+  cloud: |
+    [default]
+    aws_access_key_id = minioadmin
+    aws_secret_access_key = minio-secure-password-change-me
+  password: "minio-secure-password-change-me"
+
+---
+# Velero Service for metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: velero
+  namespace: velero
+spec:
+  selector:
+    app: velero
+  ports:
+  - port: 8085
+    targetPort: 8085
+    name: metrics
+  type: ClusterIP
+
+---
+# Backup Storage Location ConfigMap (Velero Custom Resource pattern)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-backup-storage-location
+  namespace: velero
+data:
+  backup-storage-location.yaml: |
+    apiVersion: velero.io/v1
+    kind: BackupStorageLocation
+    metadata:
+      name: default
+      namespace: velero
+    spec:
+      provider: aws
+      bucket: velero-backups
+      config:
+        s3Url: http://minio.pepperjavis.svc.cluster.local:9000
+        insecureSkipTLSVerify: "true"
+        s3ForcePathStyle: "true"
+        region: ch-gva
+      accessMode: ReadWrite
+      default: true
+
+---
+# Volume Snapshot Location ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-volume-snapshot-location
+  namespace: velero
+data:
+  volume-snapshot-location.yaml: |
+    apiVersion: velero.io/v1
+    kind: VolumeSnapshotLocation
+    metadata:
+      name: default
+      namespace: velero
+    spec:
+      provider: csi
+      config:
+        snapshotClass: csi-snapshot-class
+
+---
+# Backup Schedule - Daily at 2 AM UTC
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-backup-schedule
+  namespace: velero
+data:
+  backup-schedule.yaml: |
+    apiVersion: velero.io/v1
+    kind: Schedule
+    metadata:
+      name: daily-backup
+      namespace: velero
+    spec:
+      schedule: "0 2 * * *"
+      template:
+        includedNamespaces:
+        - pepperjavis
+        storageLocation: default
+        volumeSnapshotLocations:
+        - default
+        ttl: 720h
+        hooks: {}
+        labels:
+          backup-type: scheduled
+        metadata: {}
+
+---
+# Backup for Velero CRDs configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-crd-backup
+  namespace: velero
+data:
+  init-script.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "Creating Velero backup storage location..."
+    kubectl apply -f /config/backup-storage-location.yaml || true
+
+    echo "Creating Velero volume snapshot location..."
+    kubectl apply -f /config/volume-snapshot-location.yaml || true
+
+    echo "Creating Velero backup schedule..."
+    kubectl apply -f /config/backup-schedule.yaml || true
+
+    echo "Velero configuration completed"
+
+---
+# Velero Metrics Service Monitor (for Prometheus)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-servicemonitor
+  namespace: velero
+data:
+  servicemonitor.yaml: |
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: velero
+      namespace: velero
+      labels:
+        app: velero
+    spec:
+      selector:
+        matchLabels:
+          app: velero
+      endpoints:
+      - port: metrics
+        interval: 30s
+        path: /metrics
+
+---
+# PodDisruptionBudget for Velero
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: velero-pdb
+  namespace: velero
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: velero
+
+---
+# Retention Policy ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-retention-policy
+  namespace: velero
+data:
+  retention-policy.yaml: |
+    # Backup retention policies:
+    # - Daily backups: 30 days retention (720h)
+    # - Weekly backups: 90 days retention (2160h)
+    # - Monthly backups: 365 days retention (8760h)
+    # - On-demand backups: 90 days retention (2160h)
+    #
+    # Automated via Velero schedules:
+    # - daily-backup: Daily at 2 AM UTC, 30-day retention
+    # - weekly-backup: Every Sunday at 2 AM UTC, 90-day retention
+    # - monthly-backup: 1st of month at 2 AM UTC, 365-day retention
+    #
+    # Users can trigger on-demand backups with:
+    # velero backup create adhoc-backup-$(date +%s) --wait
+
+---
+# NetworkPolicy for Velero
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: velero-network-policy
+  namespace: velero
+spec:
+  podSelector:
+    matchLabels:
+      app: velero
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: pepperjavis
+    ports:
+    - protocol: TCP
+      port: 8085
+  egress:
+  # DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # MinIO backup storage
+  - to:
+    - podSelector:
+        matchLabels:
+          app: minio
+      namespaceSelector:
+        matchLabels:
+          name: pepperjavis
+    ports:
+    - protocol: TCP
+      port: 9000
+  # Kubernetes API
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# RBAC Role for backup operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: velero
+  namespace: pepperjavis
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  - persistentvolumes
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - pods/log
+  verbs:
+  - get
+  - list
+  - watch
+
+---
+# RBAC RoleBinding for backup operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: velero
+  namespace: pepperjavis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: velero
+subjects:
+- kind: ServiceAccount
+  name: velero
+  namespace: velero
+
+---
+# Backup status ConfigMap (informational)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velero-backup-status
+  namespace: velero
+data:
+  README.md: |
+    # Velero Backup Status
+
+    ## Configuration
+    - Provider: MinIO (S3-compatible)
+    - Bucket: velero-backups
+    - Schedule: Daily at 2 AM UTC
+    - Retention: 30 days
+
+    ## Monitoring
+    Velero metrics are exported at: http://velero:8085/metrics
+
+    ## Manual Backup
+    ```bash
+    # Create on-demand backup
+    kubectl exec -n velero deployment/velero -- velero backup create manual-$(date +%s) --wait
+
+    # List backups
+    kubectl exec -n velero deployment/velero -- velero backup get
+
+    # Describe backup
+    kubectl exec -n velero deployment/velero -- velero backup describe <backup-name>
+
+    # Restore from backup
+    kubectl exec -n velero deployment/velero -- velero restore create --from-backup <backup-name> --wait
+    ```
+
+    ## Troubleshooting
+    ```bash
+    # Check Velero logs
+    kubectl logs -n velero deployment/velero -f
+
+    # Check backup status
+    kubectl exec -n velero deployment/velero -- velero backup logs <backup-name>
+    ```

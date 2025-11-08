@@ -1,0 +1,301 @@
+# PepperJarvis Agent - Resource Quotas and Limits
+# Namespace-level resource management to prevent runaway deployments
+
+---
+# ResourceQuota for pepperjavis namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pepperjavis-quota
+  namespace: pepperjavis
+spec:
+  hard:
+    # Compute resources
+    requests.cpu: "2000m"
+    requests.memory: "2Gi"
+    limits.cpu: "4000m"
+    limits.memory: "4Gi"
+    # Pod count limits
+    pods: "20"
+    # PVC limits
+    persistentvolumeclaims: "10"
+    # Storage limits
+    requests.storage: "100Gi"
+
+---
+# LimitRange for pepperjavis namespace - Per Pod
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: pepperjavis-limit-range
+  namespace: pepperjavis
+spec:
+  limits:
+  # Container-level limits
+  - type: Container
+    max:
+      cpu: "1000m"
+      memory: "1Gi"
+    min:
+      cpu: "10m"
+      memory: "16Mi"
+    default:
+      cpu: "500m"
+      memory: "512Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+  # Pod-level limits
+  - type: Pod
+    max:
+      cpu: "2000m"
+      memory: "2Gi"
+    min:
+      cpu: "20m"
+      memory: "32Mi"
+  # PVC size limits
+  - type: PersistentVolumeClaim
+    max:
+      storage: "50Gi"
+    min:
+      storage: "1Gi"
+
+---
+# ResourceQuota for velero namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: velero-quota
+  namespace: velero
+spec:
+  hard:
+    # Compute resources
+    requests.cpu: "1000m"
+    requests.memory: "1Gi"
+    limits.cpu: "2000m"
+    limits.memory: "2Gi"
+    # Pod count limits
+    pods: "5"
+
+---
+# LimitRange for velero namespace
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: velero-limit-range
+  namespace: velero
+spec:
+  limits:
+  # Container-level limits
+  - type: Container
+    max:
+      cpu: "500m"
+      memory: "512Mi"
+    min:
+      cpu: "10m"
+      memory: "16Mi"
+    default:
+      cpu: "250m"
+      memory: "256Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+  # Pod-level limits
+  - type: Pod
+    max:
+      cpu: "1000m"
+      memory: "1Gi"
+    min:
+      cpu: "20m"
+      memory: "32Mi"
+
+---
+# NetworkPolicy ResourceQuota status check ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resource-quota-status
+  namespace: pepperjavis
+data:
+  README.md: |
+    # Resource Quota Status
+
+    ## pepperjavis namespace limits:
+    - CPU Requests: 2 cores max (100m min per container)
+    - Memory Requests: 2 Gi max (16 Mi min per container)
+    - CPU Limits: 4 cores max (1000m max per container)
+    - Memory Limits: 4 Gi max (1 Gi max per container)
+    - Maximum Pods: 20
+    - Maximum PVCs: 10
+    - Maximum Storage: 100 Gi
+
+    ## velero namespace limits:
+    - CPU Requests: 1 core max
+    - Memory Requests: 1 Gi max
+    - CPU Limits: 2 cores max
+    - Memory Limits: 2 Gi max
+    - Maximum Pods: 5
+
+    ## Check quota usage:
+    ```bash
+    # Check pepperjavis namespace quota
+    kubectl describe resourcequota pepperjavis-quota -n pepperjavis
+
+    # Check velero namespace quota
+    kubectl describe resourcequota velero-quota -n velero
+
+    # Get real-time usage
+    kubectl top pods -n pepperjavis
+    kubectl top nodes
+    ```
+
+    ## Expected monthly costs (with autoscaling 0-3 nodes):
+    - Node hours: ~72 (avg) * 1 node cheaper = baseline
+    - With 2 nodes: 1.5-1.8x baseline
+    - With 3 nodes (peak): 2.0-2.2x baseline
+    - Storage: ~30-50 PVC usage
+    - Backup storage (MinIO): ~5-10 Gi/month
+
+    ## If quota is being exceeded:
+    1. Check which deployments are consuming resources
+    2. Scale down or adjust replica counts
+    3. Review log levels and debugging settings
+    4. Consider archiving old data
+    5. Check for memory leaks or runaway processes
+
+---
+# Alert for ResourceQuota exhaustion (informational)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resource-quota-alerts
+  namespace: pepperjavis
+data:
+  alerts.yaml: |
+    groups:
+    - name: resource-quota-alerts
+      interval: 30s
+      rules:
+      # High CPU request usage
+      - alert: HighCPURequestUsage
+        expr: |
+          (sum(kube_resourcequota{resourcequota="pepperjavis-quota",type="requests",resource="cpu"}) by (namespace))
+          /
+          (sum(kube_resourcequota_hard{resourcequota="pepperjavis-quota",type="requests",resource="cpu"}) by (namespace)) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU request usage in {{ $labels.namespace }}"
+          description: "CPU requests in {{ $labels.namespace }} are {{ $value | humanizePercentage }} of quota"
+
+      # High memory request usage
+      - alert: HighMemoryRequestUsage
+        expr: |
+          (sum(kube_resourcequota{resourcequota="pepperjavis-quota",type="requests",resource="memory"}) by (namespace))
+          /
+          (sum(kube_resourcequota_hard{resourcequota="pepperjavis-quota",type="requests",resource="memory"}) by (namespace)) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory request usage in {{ $labels.namespace }}"
+          description: "Memory requests in {{ $labels.namespace }} are {{ $value | humanizePercentage }} of quota"
+
+      # Resource quota exhaustion
+      - alert: ResourceQuotaExhausted
+        expr: |
+          (kube_resourcequota_used{type="pods"} / kube_resourcequota_hard{type="pods"}) > 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Resource quota exhausted for {{ $labels.namespace }}"
+          description: "Pod quota in {{ $labels.namespace }} is {{ $value | humanizePercentage }} full"
+
+---
+# Status ConfigMap for quota monitoring
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quota-monitoring-status
+  namespace: pepperjavis
+data:
+  status: |
+    # Quota Status Dashboard
+
+    Current Time: $(date)
+
+    ## Namespace: pepperjavis
+    Quota Status:
+    - Run: kubectl get resourcequota -n pepperjavis
+    - Detailed: kubectl describe resourcequota pepperjavis-quota -n pepperjavis
+
+    ## Namespace: velero
+    Quota Status:
+    - Run: kubectl get resourcequota -n velero
+    - Detailed: kubectl describe resourcequota velero-quota -n velero
+
+    ## Usage by Pod:
+    kubectl top pods -n pepperjavis
+    kubectl top pods -n velero
+
+    ## Usage by Node:
+    kubectl top nodes
+
+---
+# Example: Deployment that respects quotas
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: compliant-deployment-example
+  namespace: pepperjavis
+data:
+  example-deployment.yaml: |
+    # Example: Pod that respects LimitRange defaults
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: example-app
+      namespace: pepperjavis
+    spec:
+      replicas: 2
+      selector:
+        matchLabels:
+          app: example-app
+      template:
+        metadata:
+          labels:
+            app: example-app
+        spec:
+          containers:
+          - name: app
+            image: myapp:v1
+            ports:
+            - containerPort: 8080
+            # No explicit resources = LimitRange defaults apply:
+            # requests: cpu: 100m, memory: 128Mi (defaultRequest)
+            # limits: cpu: 500m, memory: 512Mi (default)
+
+            # Or explicit (must be within LimitRange bounds):
+            resources:
+              requests:
+                cpu: 200m
+                memory: 256Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+
+            livenessProbe:
+              httpGet:
+                path: /health
+                port: 8080
+              initialDelaySeconds: 30
+              periodSeconds: 10
+
+            readinessProbe:
+              httpGet:
+                path: /ready
+                port: 8080
+              initialDelaySeconds: 5
+              periodSeconds: 5
